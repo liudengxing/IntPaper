@@ -92,7 +92,7 @@ dependencies:
   # webview_flutter: ^4.10.0
   
   # 文件选择器
-  file_picker: ^8.1.2
+  file_picker: ^11.0.3
   
   # 通知 - 使用官方推荐版本
   flutter_local_notifications: ^17.2.3
