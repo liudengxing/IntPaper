@@ -141,7 +141,7 @@ dependencies:
   markdown: ^7.2.2
   
   # HTML 解析（用于导入第三方数据）
-  html: ^0.15.4
+  html: ^0.15.7
 dev_dependencies:
   flutter_test:
     sdk: flutter
