@@ -1,0 +1,572 @@
+// ============================================================
+// 第二档测试 · DatabaseService
+// 使用 sqflite_common_ffi 在内存数据库中验证 CRUD 逻辑
+// ============================================================
+
+import 'dart:convert';
+
+import 'package:flutter_test/flutter_test.dart';
+import 'package:inkpaper/models/note_model.dart';
+import 'package:inkpaper/services/database_service.dart';
+import 'package:sqflite_common_ffi/sqflite_ffi.dart';
+
+// ─── 内存数据库工具 ───────────────────────────────────────────────────────────
+
+/// 直接在内存中创建与 DatabaseService 结构相同的数据库，
+/// 用于测试业务逻辑而无需依赖单例。
+Future<Database> _openTestDb() async {
+  sqfliteFfiInit();
+  databaseFactory = databaseFactoryFfi;
+
+  return databaseFactory.openDatabase(
+    inMemoryDatabasePath,
+    options: OpenDatabaseOptions(
+      version: DatabaseService.schemaVersion,
+      singleInstance: false,
+      onCreate: (db, version) async {
+        // 直接用生产建表逻辑，避免测试库结构与线上漂移
+        await DatabaseService.createSchema(db);
+      },
+    ),
+  );
+}
+
+// ─── 测试用 Note 工厂 ─────────────────────────────────────────────────────────
+
+Note _makeNote({
+  String id = 'test-001',
+  String content = '测试内容',
+  bool isSynced = false,
+  bool isPinned = false,
+  String rowStatus = 'NORMAL',
+  String visibility = 'PRIVATE',
+  List<String> tags = const [],
+}) =>
+    Note(
+      id: id,
+      content: content,
+      createdAt: DateTime(2024),
+      updatedAt: DateTime(2024),
+      isSynced: isSynced,
+      isPinned: isPinned,
+      rowStatus: rowStatus,
+      visibility: visibility,
+      tags: tags,
+    );
+
+// ─── 模拟 DatabaseService 的核心方法（直接对 db 操作） ────────────────────────
+
+Future<void> _saveNote(Database db, Note note) => db.insert(
+      'notes',
+      note.toMap(),
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+
+Future<Note?> _getNoteById(Database db, String id) async {
+  final maps = await db.query('notes', where: 'id = ?', whereArgs: [id]);
+  if (maps.isEmpty) {
+    return null;
+  }
+  return Note.fromMap(maps[0]);
+}
+
+Future<List<Note>> _getAllNotes(Database db) async {
+  final maps = await db.query('notes', orderBy: 'createdAt DESC');
+  return maps.map(Note.fromMap).toList();
+}
+
+Future<void> _deleteNote(Database db, String id) =>
+    db.delete('notes', where: 'id = ?', whereArgs: [id]);
+
+Future<void> _markSynced(Database db, String id) =>
+    db.update('notes', {'is_synced': 1}, where: 'id = ?', whereArgs: [id]);
+
+Future<int> _getCount(Database db) async {
+  final result = await db.rawQuery('SELECT COUNT(*) as count FROM notes');
+  return result.first['count']! as int;
+}
+
+Future<List<Note>> _getUnsyncedNotes(Database db) async {
+  final maps = await db.query('notes', where: 'is_synced = ?', whereArgs: [0]);
+  return maps.map(Note.fromMap).toList();
+}
+
+Future<List<Note>> _searchNotes(Database db, String query) async {
+  final normalizedQuery = query.trim();
+  if (normalizedQuery.isEmpty) {
+    return const [];
+  }
+
+  final pattern = '%$normalizedQuery%';
+  final maps = await db.query(
+    'notes',
+    where: 'content LIKE ? OR tags LIKE ?',
+    whereArgs: [pattern, pattern],
+    orderBy: 'createdAt DESC',
+  );
+  return maps.map(Note.fromMap).toList();
+}
+
+Map<String, dynamic> _parseInkPaperMarkdownMetadata(String markdown) {
+  final match = RegExp(
+    r'^---\r?\n(.*?)\r?\n---\r?\n?',
+    dotAll: true,
+  ).firstMatch(markdown);
+  expect(match, isNotNull);
+
+  final metadata = <String, dynamic>{};
+  for (final line in const LineSplitter().convert(match!.group(1) ?? '')) {
+    final separator = line.indexOf(':');
+    if (separator <= 0) {
+      continue;
+    }
+    metadata[line.substring(0, separator).trim()] =
+        jsonDecode(line.substring(separator + 1).trim());
+  }
+  metadata['content'] = markdown.substring(match.end);
+  return metadata;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+void main() {
+  late Database db;
+
+  setUpAll(() {
+    sqfliteFfiInit();
+    databaseFactory = databaseFactoryFfi;
+  });
+
+  setUp(() async {
+    db = await _openTestDb();
+  });
+
+  tearDown(() async {
+    await db.close();
+  });
+
+  // ─────────────────────────────────────────────────────────
+  // CRUD 基础操作
+  // ─────────────────────────────────────────────────────────
+  group('DatabaseService — CRUD', () {
+    test('DB-01 saveNote 插入后可通过 id 查询', () async {
+      final note = _makeNote(id: 'n1', content: '你好世界');
+      await _saveNote(db, note);
+      final found = await _getNoteById(db, 'n1');
+      expect(found, isNotNull);
+      expect(found!.content, '你好世界');
+    });
+
+    test('DB-02 saveNote 重复插入执行 upsert（替换）', () async {
+      final note = _makeNote(id: 'n2', content: '原始内容');
+      await _saveNote(db, note);
+      final updated = note.copyWith(content: '更新内容');
+      await _saveNote(db, updated);
+      final found = await _getNoteById(db, 'n2');
+      expect(found!.content, '更新内容');
+      expect(await _getCount(db), 1);
+    });
+
+    test('DB-03 deleteNote 删除后不可查询', () async {
+      await _saveNote(db, _makeNote(id: 'n3'));
+      await _deleteNote(db, 'n3');
+      final found = await _getNoteById(db, 'n3');
+      expect(found, isNull);
+    });
+
+    test('DB-04 getNotes 返回所有笔记', () async {
+      await _saveNote(db, _makeNote(id: 'a1'));
+      await _saveNote(db, _makeNote(id: 'a2'));
+      await _saveNote(db, _makeNote(id: 'a3'));
+      final notes = await _getAllNotes(db);
+      expect(notes.length, 3);
+    });
+
+    test('DB-05 空数据库查询返回空列表', () async {
+      final notes = await _getAllNotes(db);
+      expect(notes, isEmpty);
+    });
+
+    test('DB-06 getNoteById 不存在时返回 null', () async {
+      final found = await _getNoteById(db, 'non-existent');
+      expect(found, isNull);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────
+  // 同步状态管理
+  // ─────────────────────────────────────────────────────────
+  group('DatabaseService — 同步状态', () {
+    test('DB-07 markSynced 将 is_synced 设为 1', () async {
+      await _saveNote(db, _makeNote(id: 's1'));
+      await _markSynced(db, 's1');
+      final note = await _getNoteById(db, 's1');
+      expect(note!.isSynced, isTrue);
+    });
+
+    test('DB-08 getUnsyncedNotes 只返回未同步笔记', () async {
+      await _saveNote(db, _makeNote(id: 'u1'));
+      await _saveNote(db, _makeNote(id: 'u2', isSynced: true));
+      await _saveNote(db, _makeNote(id: 'u3'));
+      final unsynced = await _getUnsyncedNotes(db);
+      expect(unsynced.length, 2);
+      expect(unsynced.map((n) => n.id), containsAll(['u1', 'u3']));
+    });
+
+    test('DB-09 新插入笔记默认 is_synced=false', () async {
+      await _saveNote(db, _makeNote(id: 'def1'));
+      final note = await _getNoteById(db, 'def1');
+      expect(note!.isSynced, isFalse);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────
+  // 数据完整性
+  // ─────────────────────────────────────────────────────────
+  group('DatabaseService — 数据完整性', () {
+    test('DB-10 tags 存储和读取一致', () async {
+      final note = _makeNote(id: 't1', tags: ['flutter', 'dart', 'test']);
+      await _saveNote(db, note);
+      final found = await _getNoteById(db, 't1');
+      expect(found!.tags, containsAll(['flutter', 'dart', 'test']));
+    });
+
+    test('DB-11 isPinned=true 存储和读取一致', () async {
+      final note = _makeNote(id: 'p1', isPinned: true);
+      await _saveNote(db, note);
+      final found = await _getNoteById(db, 'p1');
+      expect(found!.isPinned, isTrue);
+    });
+
+    test('DB-12 visibility=PUBLIC 存储和读取一致', () async {
+      final note = _makeNote(id: 'v1', visibility: 'PUBLIC');
+      await _saveNote(db, note);
+      final found = await _getNoteById(db, 'v1');
+      expect(found!.visibility, 'PUBLIC');
+    });
+
+    test('DB-13 rowStatus=ARCHIVED 存储和读取一致', () async {
+      final note = _makeNote(id: 'r1', rowStatus: 'ARCHIVED');
+      await _saveNote(db, note);
+      final found = await _getNoteById(db, 'r1');
+      expect(found!.rowStatus, 'ARCHIVED');
+      expect(found.isArchived, isTrue);
+    });
+
+    test('DB-14 content 含 Unicode/Emoji 正确存储', () async {
+      final note = _makeNote(id: 'e1', content: '🎉 测试 Unicode ✅');
+      await _saveNote(db, note);
+      final found = await _getNoteById(db, 'e1');
+      expect(found!.content, '🎉 测试 Unicode ✅');
+    });
+
+    test('DB-15 getCount 返回正确笔记数', () async {
+      for (var i = 0; i < 5; i++) {
+        await _saveNote(db, _makeNote(id: 'c$i'));
+      }
+      expect(await _getCount(db), 5);
+    });
+
+    test('DB-15B Markdown 备份包含可恢复的历史时间元数据', () {
+      final source = Note(
+        id: 'md-history',
+        content: '历史 Markdown #backup',
+        createdAt: DateTime(2020, 1, 2, 3, 4, 5),
+        updatedAt: DateTime(2020, 2, 3, 4, 5, 6),
+        tags: const ['backup'],
+        isPinned: true,
+        visibility: 'PUBLIC',
+      );
+
+      final markdown = DatabaseService().exportNoteToMarkdown(source);
+      final restored = Note.fromJson(_parseInkPaperMarkdownMetadata(markdown));
+
+      expect(restored.content, source.content);
+      expect(restored.createdAt, source.createdAt);
+      expect(restored.updatedAt, source.updatedAt);
+      expect(restored.tags, source.tags);
+      expect(restored.isPinned, isTrue);
+      expect(restored.visibility, 'PUBLIC');
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────
+  // 批量操作
+  // ─────────────────────────────────────────────────────────
+  group('DatabaseService — 批量操作', () {
+    test('DB-16 批量插入 100 条笔记', () async {
+      final batch = db.batch();
+      for (var i = 0; i < 100; i++) {
+        batch.insert(
+          'notes',
+          _makeNote(id: 'batch-$i', content: '批量笔记 $i').toMap(),
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+      }
+      await batch.commit();
+      expect(await _getCount(db), 100);
+    });
+
+    test('DB-17 批量 upsert：已存在的更新，不存在的插入', () async {
+      await _saveNote(db, _makeNote(id: 'exist1', content: '旧内容'));
+      final batch = db.batch();
+      batch.insert(
+        'notes',
+        _makeNote(id: 'exist1', content: '新内容').toMap(),
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+      batch.insert(
+        'notes',
+        _makeNote(id: 'new1', content: '全新笔记').toMap(),
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+      await batch.commit();
+      expect(await _getCount(db), 2);
+      final updated = await _getNoteById(db, 'exist1');
+      expect(updated!.content, '新内容');
+    });
+
+    test('DB-18 deleteSyncedNotesNotIn 只删除已同步的不在列表中的笔记', () async {
+      await _saveNote(db, _makeNote(id: 'keep1', isSynced: true));
+      await _saveNote(db, _makeNote(id: 'keep2', isSynced: true));
+      await _saveNote(db, _makeNote(id: 'del1', isSynced: true));
+      await _saveNote(db, _makeNote(id: 'local1'));
+
+      final serverIds = ['keep1', 'keep2'];
+      final placeholders = List.filled(serverIds.length, '?').join(',');
+      await db.delete(
+        'notes',
+        where: 'is_synced = 1 AND id NOT IN ($placeholders)',
+        whereArgs: serverIds,
+      );
+
+      expect(await _getCount(db), 3); // keep1 + keep2 + local1
+      final del1 = await _getNoteById(db, 'del1');
+      expect(del1, isNull);
+      final local1 = await _getNoteById(db, 'local1');
+      expect(local1, isNotNull);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────
+  // 查询过滤
+  // ─────────────────────────────────────────────────────────
+  group('DatabaseService — 查询过滤', () {
+    test('DB-19 分页查询返回正确数量', () async {
+      for (var i = 0; i < 10; i++) {
+        await _saveNote(db, _makeNote(id: 'page-$i'));
+      }
+      final maps = await db.query(
+        'notes',
+        orderBy: 'createdAt DESC',
+        limit: 3,
+        offset: 0,
+      );
+      expect(maps.length, 3);
+    });
+
+    test('DB-20 按 rowStatus 过滤归档笔记', () async {
+      await _saveNote(db, _makeNote(id: 'norm1'));
+      await _saveNote(db, _makeNote(id: 'arch1', rowStatus: 'ARCHIVED'));
+      await _saveNote(db, _makeNote(id: 'arch2', rowStatus: 'ARCHIVED'));
+
+      final archived = await db
+          .query('notes', where: 'rowStatus = ?', whereArgs: ['ARCHIVED']);
+      expect(archived.length, 2);
+    });
+
+    test('DB-21 搜索覆盖正文和标签，并按创建时间倒序', () async {
+      await _saveNote(
+        db,
+        _makeNote(
+          id: 'old-content',
+          content: '胰腺癌随访资料',
+          tags: const ['medical'],
+        ),
+      );
+      await _saveNote(
+        db,
+        Note(
+          id: 'new-tag',
+          content: '普通正文',
+          createdAt: DateTime(2025),
+          updatedAt: DateTime(2025),
+          tags: const ['胰腺癌研究'],
+        ),
+      );
+      await _saveNote(db, _makeNote(id: 'miss', content: '不相关'));
+
+      final results = await _searchNotes(db, '胰腺癌');
+
+      expect(results.map((note) => note.id), ['new-tag', 'old-content']);
+    });
+
+    test('DB-22 按标签查询为整词匹配，不命中同前缀标签', () async {
+      await _saveNote(
+        db,
+        _makeNote(id: 'exact', content: '整词命中', tags: const ['工作', '效率']),
+      );
+      await _saveNote(
+        db,
+        _makeNote(id: 'prefix', content: '同前缀不命中', tags: const ['工作会议']),
+      );
+      await _saveNote(
+        db,
+        _makeNote(id: 'suffix', content: '后缀不同不命中', tags: const ['生活']),
+      );
+
+      Future<List<Note>> query(String tag) async {
+        final maps = await db.rawQuery(
+          'SELECT * FROM notes WHERE ${DatabaseService.tagMatchWhereClause}',
+          [DatabaseService.tagMatchPattern(tag)],
+        );
+        return maps.map(Note.fromMap).toList();
+      }
+
+      expect((await query('工作')).map((n) => n.id), ['exact']);
+      expect((await query('工作会议')).map((n) => n.id), ['prefix']);
+      expect(await query('工'), isEmpty);
+    });
+
+    test('DB-23 标签中的 LIKE 通配符不会被当成模式', () async {
+      await _saveNote(db, _makeNote(id: 'pct', content: '含百分号标签', tags: const ['100%_test']));
+      await _saveNote(db, _makeNote(id: 'other', content: '普通标签', tags: const ['100xxtest']));
+
+      final maps = await db.rawQuery(
+        'SELECT * FROM notes WHERE ${DatabaseService.tagMatchWhereClause}',
+        [DatabaseService.tagMatchPattern('100%_test')],
+      );
+
+      expect(maps.map((r) => r['id']), ['pct']);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────
+  // 软删除 / 最近删除
+  // ─────────────────────────────────────────────────────────
+  group('DatabaseService — 软删除', () {
+    test('DB-24 softDeleteNote 后视图查不到，行仍留在 notes 表', () async {
+      await _saveNote(db, _makeNote(id: 'sd1', content: '待删除'));
+      await DatabaseService().softDeleteNote('sd1', executor: db);
+
+      expect(await db.query(DatabaseService.viewActiveNotes), isEmpty);
+
+      final deleted = await db.query(
+        'notes',
+        where: "IFNULL(rowStatus, 'NORMAL') = 'DELETED'",
+      );
+      expect(deleted.map((row) => row['id']), ['sd1']);
+      expect(deleted.single['deleted_at'], isNotNull);
+    });
+
+    test('DB-25 软删后再次 upsert 不会复活笔记', () async {
+      final note = _makeNote(id: 'sd2', content: '原文');
+      await _saveNote(db, note);
+      await DatabaseService().softDeleteNote('sd2', executor: db);
+
+      await DatabaseService.upsertNote(db, note.copyWith(content: '被编辑'));
+
+      final raw = await db.query('notes', where: 'id = ?', whereArgs: ['sd2']);
+      expect(raw.single['rowStatus'], 'DELETED');
+      expect(raw.single['content'], '原文'); // 已删行不接受覆盖
+    });
+
+    test('DB-26 restoreDeletedNote 恢复为正常笔记', () async {
+      await _saveNote(db, _makeNote(id: 'sd3', content: '可恢复'));
+      await DatabaseService().softDeleteNote('sd3', executor: db);
+      await DatabaseService().restoreDeletedNote('sd3', executor: db);
+
+      final active = await db.query(DatabaseService.viewActiveNotes);
+      expect(active.map((row) => row['id']), ['sd3']);
+      expect(active.single['deleted_at'], isNull);
+    });
+
+    test('DB-27 purgeDeletedNotesOlderThan 只清理过期的软删笔记', () async {
+      await _saveNote(db, _makeNote(id: 'old', content: '旧删除'));
+      await _saveNote(db, _makeNote(id: 'fresh', content: '新删除'));
+      await _saveNote(db, _makeNote(id: 'alive', content: '正常'));
+
+      await DatabaseService().softDeleteNote(
+        'old',
+        executor: db,
+        deletedAt: DateTime.now().subtract(const Duration(days: 40)),
+      );
+      await DatabaseService().softDeleteNote('fresh', executor: db);
+
+      final removed = await DatabaseService()
+          .purgeDeletedNotesOlderThan(const Duration(days: 30), executor: db);
+
+      expect(removed, 1);
+      final ids =
+          (await db.query('notes')).map((row) => row['id']).toList();
+      expect(ids, containsAll(<String>['fresh', 'alive']));
+      expect(ids, isNot(contains('old')));
+    });
+
+    test('DB-28 purgeDeletedNote 不会误删未软删的笔记', () async {
+      await _saveNote(db, _makeNote(id: 'keep', content: '正常'));
+      await DatabaseService().purgeDeletedNote('keep', executor: db);
+
+      final rows = await db.query('notes', where: 'id = ?', whereArgs: ['keep']);
+      expect(rows, hasLength(1));
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────
+  // 待同步删除队列
+  // ─────────────────────────────────────────────────────────
+  group('DatabaseService — 待同步删除队列', () {
+    test('DB-29 只有服务端笔记的删除会入队', () async {
+      await _saveNote(db, _makeNote(id: 'server-note-1', content: '服务端笔记'));
+      await _saveNote(
+        db,
+        _makeNote(id: 'local_1700000000000_1', content: '本地笔记'),
+      );
+
+      await DatabaseService().softDeleteNote('server-note-1', executor: db);
+      await DatabaseService()
+          .softDeleteNote('local_1700000000000_1', executor: db);
+
+      final pending =
+          await DatabaseService().getPendingDeleteNoteIds(executor: db);
+      expect(pending, ['server-note-1']);
+    });
+
+    test('DB-30 重复入队不会产生重复记录', () async {
+      await DatabaseService().enqueuePendingDelete('x1', executor: db);
+      await DatabaseService().enqueuePendingDelete('x1', executor: db);
+
+      expect(await DatabaseService().getPendingDeleteCount(executor: db), 1);
+    });
+
+    test('DB-31 失败累加 attempts，成功后清除队列', () async {
+      await DatabaseService().enqueuePendingDelete('x2', executor: db);
+      await DatabaseService()
+          .markPendingDeleteAttempt('x2', error: '网络错误', executor: db);
+
+      final rows = await db.query(
+        DatabaseService.tablePendingOperations,
+        where: 'note_id = ?',
+        whereArgs: ['x2'],
+      );
+      expect(rows.single['attempts'], 1);
+      expect(rows.single['last_error'], '网络错误');
+
+      await DatabaseService().clearPendingDelete('x2', executor: db);
+      expect(
+        await DatabaseService().getPendingDeleteNoteIds(executor: db),
+        isEmpty,
+      );
+    });
+
+    test('DB-32 队列按入队顺序返回', () async {
+      await DatabaseService().enqueuePendingDelete('b', executor: db);
+      await DatabaseService().enqueuePendingDelete('a', executor: db);
+      await DatabaseService().enqueuePendingDelete('c', executor: db);
+
+      final pending =
+          await DatabaseService().getPendingDeleteNoteIds(executor: db);
+      expect(pending, ['b', 'a', 'c']);
+    });
+  });
+}

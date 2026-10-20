@@ -1,0 +1,33 @@
+// 定义全局 Android 配置
+ext {
+    compileSdkVersion = 34
+    targetSdkVersion = 34
+    minSdkVersion = 21
+}
+
+allprojects {
+    repositories {
+        // 国内镜像优先：integration_test 依赖的 androidx.test:runner:1.2+ 是动态版本，
+        // 必须拉 maven-metadata.xml 才能确定版本。直连 google() 会长时间卡住，
+        // 镜像命中后 Gradle 就不会再往后问；镜像缺包时仍会回退到官方源。
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        maven { url 'https://maven.aliyun.com/repository/central' }
+        maven { url 'https://maven.aliyun.com/repository/public' }
+
+        // 官方源兜底
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.buildDir = '../build'
+subprojects {
+    project.buildDir = "${rootProject.buildDir}/${project.name}"
+}
+subprojects {
+    project.evaluationDependsOn(':app')
+}
+
+tasks.register("clean", Delete) {
+    delete rootProject.buildDir
+} 
